@@ -3,3 +3,4 @@ dataset_*/
 runs/
 dataset_segmentation/
 *.pt
+.zip
