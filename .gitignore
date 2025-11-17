@@ -1,5 +1,7 @@
 *_env/
-dataset_*/
+.venv/
+dataset*/
+result_*/
 runs/
 dataset_segmentation/
 *.pt
