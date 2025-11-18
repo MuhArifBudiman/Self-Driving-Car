@@ -5,14 +5,25 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import cv2
 import numpy as np
+from torch.amp import autocast, GradScaler
 import os
+from total_class import detect_classes
 
+from time import time
+from datetime import datetime
 # ---- Albumentations untuk augmentasi ----
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 
+def gpu_usage():
+    alloc = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    return f"{alloc:.2f}GB / {reserved:.2f}GB"
+
 # ------------------ Dataset Loader -----------------------
+
+
 class SegmentationDataset(Dataset):
 
     def __init__(self, img_dir, mask_dir, augment=False, resize_dim=(512, 1024)):
@@ -30,7 +41,7 @@ class SegmentationDataset(Dataset):
         self.mask_values = sorted(list(all_mask_values))
         self.value_to_index = {v: i for i, v in enumerate(self.mask_values)}
 
-        print("📌 Kelas terdeteksi:", self.value_to_index)
+        # print("📌 Kelas terdeteksi:", self.value_to_index)
         # -------------------------
 
         # Transform + augmentation
@@ -161,7 +172,7 @@ class UNet(nn.Module):
 
 
 # ------------------ TRAINING LOOP -----------------------
-def train_model(dataset_path, epochs=20):
+def train_model(dataset_path, num_classes, epochs=20):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"🔥 Training on: {device.upper()}")
 
@@ -180,13 +191,17 @@ def train_model(dataset_path, epochs=20):
     train_loader = DataLoader(train_data, batch_size=2, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=2, shuffle=False)
 
-    model = UNet(num_classes=12).to(device)
+    model = UNet(num_classes=num_classes).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.0001)
     criterion = nn.CrossEntropyLoss()
 
     best_loss = float("inf")
 
-    print("\n📌 Training started...\n")
+    scaler = GradScaler()  # torch.cuda.amp.
+
+    start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    start = time()
+    print(f"\n[INFO] Training started on {start_time} \n")
 
     for epoch in range(epochs):
         model.train()
@@ -195,19 +210,27 @@ def train_model(dataset_path, epochs=20):
         train_bar = tqdm(
             train_loader, desc=f"Epoch {epoch+1}/{epochs} (Training)", ncols=90)
         try:
-            for imgs, masks in train_bar:
+            for batch_idx, (imgs, masks) in enumerate(train_bar):
                 imgs, masks = imgs.to(device), masks.to(device)
 
-                preds = model(imgs)
-                loss = criterion(preds, masks)
-
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
 
+            # Mixed Precision forward pass
+                with autocast('cuda'):
+                    preds = model(imgs)
+                    loss = criterion(preds, masks)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 total_loss += loss.item()
+
+            if (batch_idx % 5 == 0) | (batch_idx == 0):
+                train_bar.set_postfix(loss=f"{loss.item():.4f}")
+                tqdm.write(gpu_usage())
+
         except ValueError as ve:
-            print(ve)
+            tqdm.write(str(ve))
 
         avg_loss = total_loss / len(train_loader)
 
@@ -236,10 +259,17 @@ def train_model(dataset_path, epochs=20):
             torch.save(model.state_dict(), "result_unet/best_unet_model.pth")
             print("💾 Model improved → saved!")
 
-    print("\n🎉 Training Finished! Best model saved as: result_unet/best_unet_model.pth")
+    finish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    finish = time()
+    elapsed = finish - start
+
+    print(
+        f"\n[INFO] Training Finished on {finish_time} | Training time {elapsed/60:.2f} minutes ({elapsed:.1f} seconds)\n Best model saved as: result_unet/best_unet_model.pth")
 
 
 # ------------------ MAIN -----------------------
 if __name__ == "__main__":
-    dataset_path = "dataset"
-    train_model(dataset_path, epochs=20)
+    dataset_path = "D:/Learning/AI_Indonesia/project_3/Self-Driving-Car/dataset_cityscapes"
+    masks_path = os.path.join(dataset_path, "train", "masks")
+    total_class = len(detect_classes(mask_dir=masks_path))
+    train_model(dataset_path, num_classes=total_class, epochs=20)
