@@ -15,6 +15,9 @@ from datetime import datetime
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
+
+CURRENT_DIR = os.getcwd()
+
 # ------------------ Dataset Loader -----------------------
 
 
@@ -263,7 +266,8 @@ def train_model(dataset_path, num_classes, epochs=20):
 
 # ------------------ MAIN -----------------------
 if __name__ == "__main__":
-    dataset_path = "D:/Learning/AI_Indonesia/project_3/Self-Driving-Car/dataset_cityscapes"
-    masks_path = os.path.join(dataset_path, "train", "masks")
+    
+    dataset_path = "dataset_cityscapes"
+    masks_path = os.path.join(CURRENT_DIR,dataset_path, "train", "masks")
     total_class = len(detect_classes(mask_dir=masks_path))
     train_model(dataset_path, num_classes=total_class, epochs=20)
