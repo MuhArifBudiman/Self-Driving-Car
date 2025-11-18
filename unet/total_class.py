@@ -4,7 +4,7 @@ from PIL import Image
 from tqdm import tqdm
 
 
-def detect_classes(mask_dir):
+def detect_classes(mask_dir) -> int:
     unique_values = set()
 
     mask_files = [f for f in os.listdir(
@@ -20,6 +20,7 @@ def detect_classes(mask_dir):
         # Tambahkan semua nilai pixel baru ke set
         unique_values.update(np.unique(mask))
 
+    print(f"Total Classes: {len(sorted(list(unique_values)))}")
     return sorted(list(unique_values))
 
 

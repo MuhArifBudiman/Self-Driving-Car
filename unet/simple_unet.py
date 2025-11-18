@@ -11,15 +11,9 @@ from total_class import detect_classes
 
 from time import time
 from datetime import datetime
-# ---- Albumentations untuk augmentasi ----
+
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-
-
-def gpu_usage():
-    alloc = torch.cuda.memory_allocated() / 1024**3
-    reserved = torch.cuda.memory_reserved() / 1024**3
-    return f"{alloc:.2f}GB / {reserved:.2f}GB"
 
 # ------------------ Dataset Loader -----------------------
 
