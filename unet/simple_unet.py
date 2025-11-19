@@ -16,8 +16,8 @@ from datetime import datetime
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-from total_class import detect_classes
-from evaluate import calculate_miou, plot_training_history
+from .total_class import detect_classes
+from .evaluate import calculate_miou, plot_training_history
 
 import os
 
@@ -188,9 +188,8 @@ class DiceLoss(nn.Module):
         union = preds.numel() + targets.numel()
 
         return 1 - (2 * intersection + smooth) / (union + smooth)
-
+    
 # ------------------ TRAINING LOOP -----------------------
-
 
 def train_model(dataset_path, num_classes, epochs=20):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -351,14 +350,15 @@ def train_model(dataset_path, num_classes, epochs=20):
             os.makedirs("result_unet", exist_ok=True)
             torch.save(model.state_dict(), "result_unet/best_unet_model.pth")
             print(f"💾 Model improved → saved! with Best mIoU: {best_miou}")
-        plot_training_history(history=train_history)
+
+    plot_training_history(history=train_history)
 
     finish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     finish = time()
     elapsed = finish - start
 
-    print(
-        f"\n[INFO] Training Finished on {finish_time} | Training time {elapsed/60:.2f} minutes ({elapsed:.1f} seconds)\n Best model saved as: result_unet/best_unet_model.pth")
+    print(f"\n[INFO] Training Finished on {finish_time} | Training time {elapsed/60:.2f} minutes ({elapsed:.1f} seconds)\n \
+          Best model saved as: result_unet/best_unet_model.pth")
 
 
 # ------------------ MAIN -----------------------
