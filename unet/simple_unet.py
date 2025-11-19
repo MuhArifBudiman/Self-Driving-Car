@@ -2,23 +2,34 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+from torch.amp import autocast, GradScaler
+from torchvision import models
+
+from sklearn.utils.class_weight import compute_class_weight
+
 from tqdm import tqdm
 import cv2
 import numpy as np
-from torch.amp import autocast, GradScaler
-import os
-from total_class import detect_classes
-
 from time import time
 from datetime import datetime
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
+from total_class import detect_classes
+from evaluate import calculate_miou, plot_training_history
+
+import os
 
 CURRENT_DIR = os.getcwd()
 
-# ------------------ Dataset Loader -----------------------
+
+def gpu_usage():
+    if torch.cuda.is_available():
+        alloc = round(torch.cuda.memory_allocated() / 1024**2, 1)
+        reserved = round(torch.cuda.memory_reserved() / 1024**2, 1)
+        return f"GPU: {alloc}MB allocated / {reserved}MB reserved"
+    return "CPU Mode"
 
 
 class SegmentationDataset(Dataset):
@@ -38,8 +49,8 @@ class SegmentationDataset(Dataset):
         self.mask_values = sorted(list(all_mask_values))
         self.value_to_index = {v: i for i, v in enumerate(self.mask_values)}
 
-        # print("📌 Kelas terdeteksi:", self.value_to_index)
-        # -------------------------
+        self.normalize = A.Normalize(mean=(0.485, 0.456, 0.406),
+                                     std=(0.229, 0.224, 0.225))
 
         # Transform + augmentation
         self.transform = A.Compose([
@@ -47,11 +58,12 @@ class SegmentationDataset(Dataset):
             A.RandomBrightnessContrast(p=0.3),
             A.ShiftScaleRotate(shift_limit=0.02, scale_limit=0.1,
                                rotate_limit=10, p=0.5, border_mode=cv2.BORDER_CONSTANT),
+            self.normalize,
             ToTensorV2()
         ])
 
-        # Transform only resize → no augmentation (untuk validation)
         self.transform_no_aug = A.Compose([
+            self.normalize,
             ToTensorV2()
         ])
 
@@ -86,15 +98,11 @@ class SegmentationDataset(Dataset):
         img = transformed["image"].float()
         mask = transformed["mask"]
 
-        # -------------------------
-        # 🔥 Convert grayscale → class label index
-        # -------------------------
         mask = np.vectorize(self.value_to_index.get)(mask)
-        # print(np.unique(mask))
+
         return img, torch.tensor(mask, dtype=torch.long)
 
 
-# ------------------ UNET MODEL -----------------------
 class UNet(nn.Module):
 
     def __init__(self, num_classes=12):
@@ -168,7 +176,22 @@ class UNet(nn.Module):
         return self.final_layer(d1)
 
 
+class DiceLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, preds, targets, smooth=1e-6):
+        preds = torch.softmax(preds, dim=1)
+        preds = preds.argmax(dim=1)
+
+        intersection = (preds == targets).sum().float()
+        union = preds.numel() + targets.numel()
+
+        return 1 - (2 * intersection + smooth) / (union + smooth)
+
 # ------------------ TRAINING LOOP -----------------------
+
+
 def train_model(dataset_path, num_classes, epochs=20):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"🔥 Training on: {device.upper()}")
@@ -190,12 +213,63 @@ def train_model(dataset_path, num_classes, epochs=20):
 
     model = UNet(num_classes=num_classes).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.0001)
-    criterion = nn.CrossEntropyLoss()
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    best_loss = float("inf")
+    mask_dir = os.path.join(dataset_path, "train/masks")
 
+    class_list = detect_classes(mask_dir)   # already sorted from your function
+
+    # 2️⃣ Ensure jumlah kelas sesuai
+    assert num_classes == len(class_list), \
+        f"Mismatch: num_classes ({num_classes}) ≠ detected mask classes ({len(class_list)})"
+
+    print(f"📌 Using {num_classes} classes")
+
+    # 3️⃣ Mapping pixel values → class index (karena mask mungkin tidak mulai dari 0)
+    label_mapping = {label: idx for idx, label in enumerate(class_list)}
+    print(f"🗂 Label Mapping: {label_mapping}")
+
+    # 4️⃣ Kumpulkan semua pixel mask untuk compute class weight
+    all_pixels = []
+    for f in os.listdir(mask_dir):
+        m = cv2.imread(os.path.join(mask_dir, f), 0)
+        m = np.vectorize(label_mapping.get)(m)
+        all_pixels.extend(m.reshape(-1))
+
+    all_pixels = np.array(all_pixels)
+
+    # 5️⃣ Hitung kelas yang benar-benar muncul
+    present_classes = np.unique(all_pixels)
+    print(
+        f"📌 Classes present in dataset: {present_classes.tolist()} ({len(present_classes)} classes used)")
+
+    # 6️⃣ Compute class weight hanya dari kelas yang muncul
+    class_weights = compute_class_weight(
+        class_weight="balanced",
+        classes=present_classes,
+        y=all_pixels
+    )
+
+    # 7️⃣ Buat tensor dengan size FULL num_classes → biar indexing tetap konsisten
+    weights_tensor = torch.zeros(num_classes, dtype=torch.float)
+
+    for idx, cw in zip(present_classes, class_weights):
+        weights_tensor[idx] = cw
+
+    weights_tensor = weights_tensor.to(device)
+
+    ce_loss = nn.CrossEntropyLoss(weight=weights_tensor)
+    dice_loss = DiceLoss()
+
+    # best_loss = float("inf")
+    best_miou = 0.0
     scaler = GradScaler()  # torch.cuda.amp.
-
+    train_history = {
+        "train_acc": [],
+        "train_loss": [],
+        "val_acc": [],
+        "val_loss": []
+    }
     start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     start = time()
     print(f"\n[INFO] Training started on {start_time} \n")
@@ -203,34 +277,39 @@ def train_model(dataset_path, num_classes, epochs=20):
     for epoch in range(epochs):
         model.train()
         total_loss = 0
-
+        train_correct_pixels = 0
+        train_total_pixels = 0
+        val_miou_total = 0
+        val_correct_pixels = 0
+        val_total_pixels = 0
         train_bar = tqdm(
             train_loader, desc=f"Epoch {epoch+1}/{epochs} (Training)", ncols=90)
-        try:
-            for batch_idx, (imgs, masks) in enumerate(train_bar):
-                imgs, masks = imgs.to(device), masks.to(device)
 
-                optimizer.zero_grad()
+        for batch_idx, (imgs, masks) in enumerate(train_bar):
+            imgs, masks = imgs.to(device), masks.to(device)
 
-            # Mixed Precision forward pass
-                with autocast('cuda'):
-                    preds = model(imgs)
-                    loss = criterion(preds, masks)
+            optimizer.zero_grad()
 
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                total_loss += loss.item()
+        # Mixed Precision forward pass
+            with autocast('cuda'):
+                preds = model(imgs)
+                loss = ce_loss(preds, masks) + 0.5 * \
+                    dice_loss(preds, masks)
+                train_correct_pixels += (torch.argmax(preds,
+                                         dim=1) == masks).sum().item()
 
-            if (batch_idx % 5 == 0) | (batch_idx == 0):
-                train_bar.set_postfix(loss=f"{loss.item():.4f}")
-                tqdm.write(gpu_usage())
+                train_total_pixels += masks.numel()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item()
 
-        except ValueError as ve:
-            tqdm.write(str(ve))
+        if (batch_idx % 5 == 0) | (batch_idx == 0):
+            train_bar.set_postfix(loss=f"{loss.item():.4f}")
+            tqdm.write(gpu_usage())
 
         avg_loss = total_loss / len(train_loader)
-
+        # VALIDATION
         model.eval()
         val_loss = 0
 
@@ -241,20 +320,38 @@ def train_model(dataset_path, num_classes, epochs=20):
                 imgs, masks = imgs.to(device), masks.to(device)
 
                 preds = model(imgs)
-                loss = criterion(preds, masks)
+                loss = ce_loss(preds, masks) + 0.5 * dice_loss(preds, masks)
 
+                miou = calculate_miou(preds, masks, num_classes)
+                val_miou_total += miou
+                val_correct_pixels += (torch.argmax(preds,
+                                       dim=1) == masks).sum().item()
+                val_total_pixels += masks.numel()
                 val_loss += loss.item()
 
         avg_val_loss = val_loss / len(val_loader)
+        avg_val_miou = val_miou_total / len(val_loader)
+        train_accuracy = train_correct_pixels / train_total_pixels
+        val_accuracy = val_correct_pixels / val_total_pixels
 
         print(
             f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        train_history['train_acc'].append(train_accuracy)
+        train_history['train_loss'].append(avg_loss)
+        train_history['val_acc'].append(val_accuracy)
+        train_history['val_loss'].append(avg_val_loss)
+
+        print(f"[INFO] LR now: {current_lr:.8f}")
+
+        if avg_val_miou < best_miou:
+            best_miou = avg_val_miou
             os.makedirs("result_unet", exist_ok=True)
             torch.save(model.state_dict(), "result_unet/best_unet_model.pth")
-            print("💾 Model improved → saved!")
+            print(f"💾 Model improved → saved! with Best mIoU: {best_miou}")
+        plot_training_history(history=train_history)
 
     finish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     finish = time()
@@ -266,8 +363,8 @@ def train_model(dataset_path, num_classes, epochs=20):
 
 # ------------------ MAIN -----------------------
 if __name__ == "__main__":
-    
+
     dataset_path = "dataset_cityscapes"
-    masks_path = os.path.join(CURRENT_DIR,dataset_path, "train", "masks")
+    masks_path = os.path.join(CURRENT_DIR, dataset_path, "train", "masks")
     total_class = len(detect_classes(mask_dir=masks_path))
-    train_model(dataset_path, num_classes=total_class, epochs=20)
+    train_model(dataset_path, num_classes=total_class, epochs=2)
